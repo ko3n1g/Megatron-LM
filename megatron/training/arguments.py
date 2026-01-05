@@ -2770,9 +2770,6 @@ def _add_distributed_args(parser):
     group.add_argument('--disable-symmetric-registration', action='store_true', dest='disable_symmetric_registration',
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.')
-    group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
-                       default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
-                       'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
     group.add_argument('--use-sharp', action='store_true', 
                        help='Required to enable SHARP communication.')
     group.add_argument('--sharp-enabled-group', type=str, default=None,

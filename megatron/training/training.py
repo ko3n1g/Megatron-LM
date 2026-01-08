@@ -49,6 +49,9 @@ except ImportError:
 
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_linear_attention_variant,
+)
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_model_config,
@@ -275,9 +278,6 @@ def num_floating_point_operations(args, batch_size):
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
         # TODO(helenn/dnarayanan): Refactor this to reuse the helper methods.
-        # Attention projection size.
-        query_projection_size = args.kv_channels * args.num_attention_heads
-        query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
         # Group Query Attention.
         if not args.group_query_attention:
             args.num_query_groups = args.num_attention_heads
@@ -368,10 +368,9 @@ def num_floating_point_operations(args, batch_size):
                     + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                     + 1
                 )
-            self_attn_term = (
+            standard_self_attn_term = (
                 3
                 * 2  # fwd(1) + bwd(2) *FMA
-                * num_layers
                 * (
                     ## q lora + rope + q norm
                     q_term
@@ -388,28 +387,100 @@ def num_floating_point_operations(args, batch_size):
                     ## core attn
                     + args.seq_length
                     * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2
+                    / 2  # causal mask (only half of the mask is non-zero)
                     + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
                 )
             )
 
         else:
             ## MHA or GQA
-            self_attn_term = (
-                expansion_factor
-                * num_layers
-                * args.hidden_size
-                * args.hidden_size
+            query_projection_size = args.kv_channels * args.num_attention_heads
+            key_projection_size = args.kv_channels * args.num_query_groups
+            value_projection_size = args.kv_channels * args.num_query_groups
+            standard_self_attn_term = (
+                3
+                * 2  # fwd(1) + bwd(2) *FMA
                 * (
-                    (
-                        1
-                        + (args.num_query_groups / args.num_attention_heads)
-                        # # Only half of the attention matrix is non-zero and needs to be multiplied with V.
-                        + (args.seq_length / args.hidden_size / 2)
-                    )
-                    * query_projection_to_hidden_size_ratio
+                    ## qkv proj
+                    args.hidden_size
+                    * (query_projection_size + key_projection_size + value_projection_size)
+                    ## core attention
+                    + query_projection_size
+                    * args.seq_length
+                    / 2  # causal mask (only half of the mask is non-zero)
+                    * 2  # QK^T and (QK^T)V
+                    ## out proj
+                    + query_projection_size
+                    * args.hidden_size
                 )
             )
+
+        if is_linear_attention_variant(args.experimental_attention_variant):
+            # Calculate number of dense and MoE Transformer MLPs.
+            if isinstance(args.linear_attention_freq, int):
+                linear_attention_pattern = [
+                    # [1,1,...,1,0,1,1,...,1,0,...]
+                    0 if ((i + 1) % args.linear_attention_freq == 0)
+                    else 1 for i in range(num_layers)
+                ]
+            elif isinstance(args.linear_attention_freq, list):
+                linear_attention_pattern = args.linear_attention_freq
+                assert len(linear_attention_pattern) == num_layers, (
+                    f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
+                    f"expected {num_layers}, "
+                    f"current linear attention pattern: {args.linear_attention_freq}"
+                )
+            elif args.linear_attention_freq is None:
+                linear_attention_pattern = [1] * num_layers
+            else:
+                raise ValueError(
+                    f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
+                    f" {args.linear_attention_freq}"
+                )
+            num_linear_attention_layers = sum(linear_attention_pattern)
+            num_standard_attention_layers = num_layers - num_linear_attention_layers
+
+            if args.experimental_attention_variant == "gated_delta_net":
+                # Calculate the FLOPs for the gated delta net attention.
+                qk_head_dim = args.linear_key_head_dim
+                v_head_dim = args.linear_value_head_dim
+                num_qk_heads = args.linear_num_key_heads
+                num_v_heads = args.linear_num_value_heads
+                qk_dim = qk_head_dim * num_qk_heads
+                v_dim = v_head_dim * num_v_heads
+                linear_self_attn_term = (
+                    3
+                    * 2  # fwd(1) + bwd(2) *FMA
+                    * (
+                        ## in proj
+                        args.hidden_size
+                        * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+                        ## conv1d
+                        + args.linear_conv_kernel_dim
+                        * (2 * qk_dim + v_dim)
+                        ## gated delta rule
+                        + num_v_heads
+                        * (v_head_dim ** 2)
+                        * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
+                        ## out proj
+                        + args.hidden_size
+                        * v_dim
+                    )
+                )
+            else:
+                raise ValueError(
+                    "Invalid experimental_attention_variant: "
+                    f"{args.experimental_attention_variant}"
+                )
+        else:
+            num_linear_attention_layers = 0
+            linear_self_attn_term = 0
+            num_standard_attention_layers = num_layers
+
+        self_attn_term = (
+            linear_self_attn_term * num_linear_attention_layers
+            + standard_self_attn_term * num_standard_attention_layers
+        )
 
         total_floating_point_operations = (
             batch_size
@@ -955,124 +1026,119 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model.model_type = model_type
         return model
 
-    # Setup stream for model building/ddp initialization. The side-stream may be necessary for
-    #  cuda graph capture support with DDP, but we sync it with the current stream to avoid race
-    #  conditions.
-    setup_stream = torch.cuda.Stream()
-    # Wait for the default stream to complete before starting setup_stream
-    setup_stream.wait_stream(torch.cuda.current_stream())
-    # Make setup_stream start after whatever the default stream already queued
-    with torch.cuda.stream(setup_stream):
-        if args.init_model_with_meta_device:
-            with torch.device('meta'):
-                model = build_model()
-        else:
+
+    if args.init_model_with_meta_device:
+        with torch.device('meta'):
             model = build_model()
+    else:
+        model = build_model()
 
-        if not isinstance(model, list):
-            model = [model]
+    if not isinstance(model, list):
+        model = [model]
 
-        # Set tensor model parallel attributes if not set.
-        # Only parameters that are already tensor model parallel have these
-        # attributes set for them. We should make sure the default attributes
-        # are set for all params so the optimizer can use them.
-        for model_module in model:
-            for param in model_module.parameters():
-                tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+    # Set tensor model parallel attributes if not set.
+    # Only parameters that are already tensor model parallel have these
+    # attributes set for them. We should make sure the default attributes
+    # are set for all params so the optimizer can use them.
+    for model_module in model:
+        for param in model_module.parameters():
+            tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
-        # Print number of parameters.
-        num_parameters = sum(
-            [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
+    # Print number of parameters.
+    num_parameters = sum(
+        [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
+    )
+    if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
+        print(
+            ' > number of parameters on (tensor, pipeline) '
+            'model parallel rank ({}, {}): {}'.format(
+                get_pg_rank(pg_collection.tp),
+                get_pg_rank(pg_collection.pp),
+                num_parameters,
+            ),
+            flush=True,
         )
-        if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
-            print(
-                ' > number of parameters on (tensor, pipeline) '
-                'model parallel rank ({}, {}): {}'.format(
-                    get_pg_rank(pg_collection.tp),
-                    get_pg_rank(pg_collection.pp),
-                    num_parameters,
-                ),
-                flush=True,
-            )
 
-        # GPU allocation.
-        # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
-        # in the fully_shard function of FSDP2 instead.
-        if (
-            not (args.use_torch_fsdp2 and args.use_cpu_initialization)
-            and not args.init_model_with_meta_device
-        ):
-            for model_module in model:
-                model_module.cuda(torch.cuda.current_device())
+    # GPU allocation.
+    # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
+    # in the fully_shard function of FSDP2 instead.
+    if (
+        not (args.use_torch_fsdp2 and args.use_cpu_initialization)
+        and not args.init_model_with_meta_device
+    ):
+        for model_module in model:
+            model_module.cuda(torch.cuda.current_device())
 
-        # Fp16 conversion.
-        if args.fp16 or args.bf16:
-            config = get_model_config(model[0])
-            model = [Float16Module(config, model_module) for model_module in model]
+    # Fp16 conversion.
+    if args.fp16 or args.bf16:
+        config = get_model_config(model[0])
+        model = [Float16Module(config, model_module) for model_module in model]
 
-        # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
-        if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
-            #for model_module in model:
-            model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
+    # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
+    if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
+        model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
 
+    # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
+    #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
+    #               from the current fp8 param) to its amax_history. The below function will correct
+    #               the amax_history back.
+    # After TE2.x: Below function is an empty function and does nothing.
+    correct_amax_history_if_needed(model)
 
+    if wrap_with_ddp:
+        if args.use_torch_fsdp2:
+            assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
+            DP = torch_FSDP
+        elif args.use_megatron_fsdp:
+            DP = megatron_FSDP
+        else:
+            DP = DDP
 
+        config = get_model_config(model[0])
 
-        # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
-        #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
-        #               from the current fp8 param) to its amax_history. The below function will correct
-        #               the amax_history back.
-        # After TE2.x: Below function is an empty function and does nothing.
-        correct_amax_history_if_needed(model)
-
-        if wrap_with_ddp:
-            if args.use_torch_fsdp2:
-                assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
-                DP = torch_FSDP
-            elif args.use_megatron_fsdp:
-                DP = megatron_FSDP
+        if getattr(args, "use_torch_fsdp2", False):
+            reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
+            ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+        else:
+            kwargs = {}
+            for f in dataclasses.fields(DistributedDataParallelConfig):
+                if hasattr(args, f.name):
+                    kwargs[f.name] = getattr(args, f.name)
+            kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
+            kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
+            kwargs['check_for_large_grads'] = args.check_for_large_grads
+            if args.ddp_num_buckets is not None:
+                assert args.ddp_bucket_size is None, \
+                    "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
+                assert args.ddp_num_buckets > 0, \
+                    "--ddp-num-buckets must be greater than 0"
+                kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
             else:
-                DP = DDP
+                kwargs['bucket_size'] = args.ddp_bucket_size
+            kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
+            kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
+            kwargs['average_in_collective'] = args.ddp_average_in_collective
+            ddp_config = DistributedDataParallelConfig(**kwargs)
 
-            config = get_model_config(model[0])
-
-            if getattr(args, "use_torch_fsdp2", False):
-                reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-                ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
-            else:
-                kwargs = {}
-                for f in dataclasses.fields(DistributedDataParallelConfig):
-                    if hasattr(args, f.name):
-                        kwargs[f.name] = getattr(args, f.name)
-                kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
-                kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
-                kwargs['check_for_large_grads'] = args.check_for_large_grads
-                if args.ddp_num_buckets is not None:
-                    assert args.ddp_bucket_size is None, \
-                        "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
-                    assert args.ddp_num_buckets > 0, \
-                        "--ddp-num-buckets must be greater than 0"
-                    kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
-                else:
-                    kwargs['bucket_size'] = args.ddp_bucket_size
-                kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
-                kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
-                kwargs['average_in_collective'] = args.ddp_average_in_collective
-                ddp_config = DistributedDataParallelConfig(**kwargs)
-
-                # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
-                # If bucket_size is not provided as an input, use sane default.
-                # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
-                # ring-reduce implementations are large enough to remain bandwidth-bound rather than
-                # latency-bound.
-                if ddp_config.bucket_size is None:
-                    ddp_config.bucket_size = max(
-                        40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
-                    )
-                # Set bucket_size to infinity if overlap_grad_reduce is False.
-                if not ddp_config.overlap_grad_reduce:
-                    ddp_config.bucket_size = None
-
+            # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
+            # If bucket_size is not provided as an input, use sane default.
+            # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
+            # ring-reduce implementations are large enough to remain bandwidth-bound rather than
+            # latency-bound.
+            if ddp_config.bucket_size is None:
+                ddp_config.bucket_size = max(
+                    40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
+                )
+            # Set bucket_size to infinity if overlap_grad_reduce is False.
+            if not ddp_config.overlap_grad_reduce:
+                ddp_config.bucket_size = None
+        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
+        #  capture support with DDP, but we sync it with the current stream to avoid races.
+        ddp_stream = torch.cuda.Stream()
+        # Wait for the default stream to complete before starting ddp_stream
+        ddp_stream.wait_stream(torch.cuda.current_stream())
+        # Make ddp_stream start after whatever the default stream already queued
+        with torch.cuda.stream(ddp_stream):
             model = [
                 DP(
                     config=config,
@@ -1085,15 +1151,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
+        # End of setup_stream
+        # Critical: ensure side-stream work completes before touching params on default stream
+        torch.cuda.current_stream().wait_stream(ddp_stream)
 
-            # Broadcast params from data parallel src rank to other data parallel ranks.
-            if args.data_parallel_random_init:
-                for model_module in model:
-                    model_module.broadcast_params()
-
-    # End of setup_stream
-    # Critical: ensure side-stream work completes before touching params on default stream
-    torch.cuda.current_stream().wait_stream(setup_stream)
+        # Broadcast params from data parallel src rank to other data parallel ranks.
+        if args.data_parallel_random_init:
+            for model_module in model:
+                model_module.broadcast_params()
 
     return model
 

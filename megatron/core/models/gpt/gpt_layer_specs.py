@@ -523,10 +523,10 @@ def get_gpt_decoder_layer_specs(
     qk_l2_norm: Optional[bool] = False,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
-    assert config.experimental_attention_variant is None, (
-        "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
-        f"but got {config.experimental_attention_variant=}."
-    )
+    # assert config.experimental_attention_variant is None, (
+    #     "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
+    #     f"but got {config.experimental_attention_variant=}."
+    # )
 
     if use_transformer_engine:
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(

@@ -21,8 +21,8 @@ MODEL_ARGS:
   --sequence-parallel: true
   --disable-bias-linear: true
   --micro-batch-size: 4
-  --rampup-batch-size: "[384 384 97656250]"
-  --global-batch-size: 1152
+  --rampup-batch-size: "[12 12 97656250]"
+  --global-batch-size: 36 # or 32 node 1152
   --train-samples: 19531250
   --manual-gc: true
   # Transformer Engine args
@@ -70,7 +70,7 @@ MODEL_ARGS:
   # Add checkpointing args
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --save-interval: 5000
+  --save-interval: 100
   --save-retain-interval: 10000
   # Add initialization args
   --init-method-std: 0.0134

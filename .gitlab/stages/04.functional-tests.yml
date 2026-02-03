@@ -33,7 +33,7 @@ functional:configure:
     - job: integration:run_dev_dgx_h100
       optional: true
   extends: [.functional_tests_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  image: ${UTILITY_IMAGE}:43229320
   tags:
     - arch/amd64
     - env/prod
@@ -72,7 +72,7 @@ functional:configure:
         "--time-limit $FUNCTIONAL_TEST_TIME_LIMIT"
         "--test-cases $FUNCTIONAL_TEST_CASES"
         "--container-image ${UTILITY_IMAGE}"
-        "--container-tag ${CI_PIPELINE_ID}"
+        "--container-tag 43229320"
         "--dependent-job functional:configure"
         "--record-checkpoints ${RECORD_CHECKPOINTS}"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
@@ -205,15 +205,15 @@ functional:run_dev_dgx_gb200:
 functional:run_nemo:
   extends: [.functional_tests_rules]
   trigger:
-    project: 'dl/joc/nemo-ci'
+    project: "dl/joc/nemo-ci"
     branch: main-mirror
     strategy: depend
   inherit:
     variables: true
   variables:
     MCORE_MR_COMMIT: $CI_COMMIT_SHA
-    TEST_NEMO2_MODULE: 'True'
-    ALLOW_FAILURE_DEPENDENCY: 'True'
+    TEST_NEMO2_MODULE: "True"
+    ALLOW_FAILURE_DEPENDENCY: "True"
     TESTS_TO_RUN_ON_THIS_COMMIT: nightly
   rules:
     - if: $FUNCTIONAL_TEST == "yes"
@@ -223,7 +223,7 @@ functional:run_nemo:
 
 functional:x_notify:
   extends: [.functional_tests_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  image: ${UTILITY_IMAGE}:43229320
   needs:
     - functional:run_lts_dgx_a100
     - functional:run_dev_dgx_a100
@@ -254,7 +254,7 @@ functional:x_notify:
     - export TEAM_SLUG=$SLACK_ADMIN
     - |
       python tests/test_utils/python_scripts/notify.py \
-        --pipeline-id "${CI_PIPELINE_ID}" \
+        --pipeline-id "43229320" \
         --check-for functional-tests \
         --pipeline-context $CONTEXT \
         --pipeline-created-at "${CI_PIPELINE_CREATED_AT}"
@@ -270,7 +270,7 @@ functional:x_notify:
 
 functional:x_download_golden_values:
   extends: [.functional_tests_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  image: ${UTILITY_IMAGE}:43229320
   tags:
     - arch/amd64
     - env/prod
@@ -282,7 +282,7 @@ functional:x_download_golden_values:
     - env
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
-    - python tests/test_utils/python_scripts/download_golden_values.py --pipeline-id ${CI_PIPELINE_ID}
+    - python tests/test_utils/python_scripts/download_golden_values.py --pipeline-id 43229320
   artifacts:
     paths:
       - tests/

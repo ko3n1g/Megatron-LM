@@ -23,6 +23,7 @@
     DOCKER_TLS_CERTDIR: "/certs"
     DOCKER_TLS_VERIFY: 1
     DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+    TAG: purpose/builder-large
     STAGE: jet
     MCORE_BACKWARDS_REF: core_r0.14.0
     KUBERNETES_SERVICE_MEMORY_REQUEST: 90Gi
@@ -33,7 +34,7 @@
     - apk add bash curl git
     - export TE_GIT_REF=$TE_GIT_REF
     - export GH_TOKEN=$GH_TOKEN
-    - bash .gitlab/scripts/build.sh
+    # - bash .gitlab/scripts/build.sh
 
     - git fetch origin $MCORE_BACKWARDS_REF
     - MCORE_BACKWARDS_COMMIT=$(git rev-parse FETCH_HEAD)
@@ -127,11 +128,11 @@ test:build_image:
       env
       eval "IMAGE=\$$IMAGE"
 
-      docker manifest create ${IMAGE}:${CI_PIPELINE_ID} \
-        ${IMAGE}:${CI_PIPELINE_ID}-amd64 \
-        ${IMAGE}:${CI_PIPELINE_ID}-arm64
+      # docker manifest create ${IMAGE}:${CI_PIPELINE_ID} \
+      #   ${IMAGE}:${CI_PIPELINE_ID}-amd64 \
+      #   ${IMAGE}:${CI_PIPELINE_ID}-arm64
 
-      docker manifest push ${IMAGE}:${CI_PIPELINE_ID}
+      # docker manifest push ${IMAGE}:${CI_PIPELINE_ID}
     - echo "MCORE_MR_COMMIT=$CI_COMMIT_SHA" | tee -a build.env
     - echo "MCORE_BACKWARDS_COMMIT=$MCORE_BACKWARDS_COMMIT" | tee -a build.env
     - cat build.env

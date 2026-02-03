@@ -71,6 +71,7 @@ RUN bash -ex <<"EOF"
 
     git clone --branch hybrid-ep https://github.com/Autumn1998/DeepEP.git
     pushd DeepEP
+        git fetch origin df375b40f24e5c495e2db36e808125266661652c
         git checkout df375b40f24e5c495e2db36e808125266661652c
         patch -p1 < /workspace/deepep.patch
     popd

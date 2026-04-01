@@ -111,7 +111,6 @@ def test_hf_tokenizer():
         "/opt/data/tokenizers/huggingface",
         metadata_path=metadata,
         chat_template=chat_template,
-        include_special_tokens=False,
         **special_tokens,
     )
 

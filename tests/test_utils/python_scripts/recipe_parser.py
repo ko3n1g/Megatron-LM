@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import itertools
+import json
 import logging
 import pathlib
 from typing import List, Optional, Set
@@ -242,25 +243,54 @@ def filter_by_test_case(workload_manifests: List[dotdict], test_case: str) -> Op
     return workload_manifests[0]
 
 
+def _identity_without_scope(workload_manifest: dotdict) -> str:
+    """Serialize a workload's identity with its scope tier removed.
+
+    Scope is a suite/cost label used only for selection; it is not part of a
+    workload's executable identity (``{test_case}_{environment}_{platforms}``).
+    Two flattened rows that differ solely by scope tier therefore describe the
+    same job and must be treated as one.
+    """
+    identity = {key: value for key, value in workload_manifest.items() if key != "spec"}
+    identity["spec"] = {
+        key: value for key, value in workload_manifest["spec"].items() if key != "scope"
+    }
+    return json.dumps(identity, sort_keys=True, default=str)
+
+
 def filter_by_scope(workload_manifests: List[dotdict], scope: str) -> List[dotdict]:
     """Returns all workloads whose scope is in the resolved filter tier set.
 
     The filter input is legacy-aliased per token. Pass comma-separated tiers for a
     union, e.g. ``--scope L1,L2`` (full GitLab MR) or legacy names such as
     ``--scope mr-github``.
+
+    A recipe row tagged with several in-filter tiers (e.g. ``scope: [L1, L2]``)
+    flattens into one row per tier, all identical except for the scope label.
+    Under a union filter every such row matches, so the same job would be
+    returned multiple times — which downstream collapses to an empty workload
+    set (`filter_by_test_case` rejects duplicate test cases). Deduplicate by
+    executable identity here so a workload matched via several tiers is returned
+    exactly once, while rows that genuinely differ (e.g. distinct cadence from
+    ``scope: [mr, nightly]``) are preserved.
     """
     resolved_scopes = _resolve_scope_filter(scope)
-    workload_manifests = list(
-        workload_manifest
-        for workload_manifest in workload_manifests
-        if workload_manifest.spec["scope"] in resolved_scopes
-    )
+    seen_identities: Set[str] = set()
+    deduped_manifests: List[dotdict] = []
+    for workload_manifest in workload_manifests:
+        if workload_manifest.spec["scope"] not in resolved_scopes:
+            continue
+        identity = _identity_without_scope(workload_manifest)
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        deduped_manifests.append(workload_manifest)
 
-    if len(workload_manifests) == 0:
+    if len(deduped_manifests) == 0:
         logger.info("No test_case found!")
         return []
 
-    return workload_manifests
+    return deduped_manifests
 
 
 def filter_by_cadence(workload_manifests: List[dotdict], cadence: Optional[str]) -> List[dotdict]:

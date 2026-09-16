@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -31,6 +32,9 @@ MERGE_QUEUE_REF_PREFIX = "gh-readonly-queue/"
 RECONCILE_MODE = "reconcile"
 RECONCILE_PR_LIMIT = 1500
 RECONCILE_PUBLISH_LIMIT = 150
+VERIFY_MODE = "verify"
+VERIFY_TIMEOUT_SECONDS = 600
+VERIFY_POLL_SECONDS = 15
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -105,13 +109,19 @@ def select_existing_gate(
     return max(matching, key=_check_run_id) if matching else None
 
 
+def gate_conclusion(source: dict[str, object]) -> str:
+    """Map a DCO App verdict onto the fail-closed gate conclusion it must report."""
+
+    return "success" if source.get("conclusion") == "success" else "failure"
+
+
 def gate_payload(
     source: dict[str, object], head_sha: str, *, include_head: bool
 ) -> dict[str, object]:
     """Build a fail-closed create or update request for the mirrored gate."""
 
     source_conclusion = source.get("conclusion")
-    conclusion = "success" if source_conclusion == "success" else "failure"
+    conclusion = gate_conclusion(source)
     source_id = _check_run_id(source)
     source_url = source.get("html_url")
     source_output = source.get("output", {})
@@ -339,6 +349,58 @@ def reconcile_open_pull_requests(repository: str, api_url: str, token: str) -> d
     return outcomes
 
 
+def await_dco_verdict(
+    api_url: str,
+    repository: str,
+    head_sha: str,
+    token: str,
+    *,
+    timeout: float = VERIFY_TIMEOUT_SECONDS,
+    poll: float = VERIFY_POLL_SECONDS,
+) -> dict[str, object]:
+    """Wait for the trusted DCO App to publish a completed verdict for this head.
+
+    The DCO App reports on pull-request events, which precede the mirror-branch push that
+    runs this job, so the verdict is normally already there; the wait only covers the case
+    where it is not. Running out of time is a hard error, never a pass.
+    """
+
+    deadline = time.monotonic() + timeout
+    while True:
+        check_runs = _list_check_runs(api_url, repository, head_sha, DCO_CHECK_NAME, token)
+        try:
+            return select_latest_dco(check_runs, head_sha)
+        except GateError:
+            pass
+        if time.monotonic() >= deadline:
+            raise GateError(f"no completed DCO App verdict for {head_sha} within {timeout:g}s")
+        time.sleep(poll)
+
+
+def _run_verify(repository: str, api_url: str, token: str) -> int:
+    """Report the trusted DCO verdict as this job's own result, from the mirror-ref suite.
+
+    A job reports into the check suite of the branch GitHub Actions ran it for, which is a
+    real branch of this repository. That is the difference from the published gate: a check
+    run created through the Checks API is pinned to the first suite for its head SHA, which
+    for a fork pull request is keyed to a branch this repository does not have, and a merge
+    box that fails to bind that suite cannot be repaired by republishing into it.
+    """
+
+    head_sha = _validated_sha(os.environ.get("GITHUB_SHA"), "workflow head")
+    source = await_dco_verdict(api_url, repository, head_sha, token)
+    output = source.get("output")
+    summary = output.get("summary") if isinstance(output, dict) else None
+    sys.stdout.write(
+        f"DCO App reported `{source.get('conclusion')}` for {head_sha} "
+        f"({source.get('html_url')})\n{summary or ''}\n"
+    )
+    if gate_conclusion(source) != "success":
+        sys.stderr.write(f"{GATE_CHECK_NAME} failed: commits are not signed off\n")
+        return 1
+    return 0
+
+
 def _run_reconcile(repository: str, api_url: str, token: str) -> None:
     outcomes = reconcile_open_pull_requests(repository, api_url, token)
     counts = " ".join(f"{name}={len(numbers)}" for name, numbers in outcomes.items())
@@ -371,8 +433,11 @@ def main() -> int:
         repository = os.environ["GITHUB_REPOSITORY"]
         token = os.environ["GITHUB_TOKEN"]
         api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
-        if os.environ.get("DCO_GATE_MODE") == RECONCILE_MODE:
+        mode = os.environ.get("DCO_GATE_MODE")
+        if mode == RECONCILE_MODE:
             _run_reconcile(repository, api_url, token)
+        elif mode == VERIFY_MODE:
+            return _run_verify(repository, api_url, token)
         else:
             _run_publish(repository, api_url, token)
     except (GateError, KeyError, OSError, json.JSONDecodeError) as error:

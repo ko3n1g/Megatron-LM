@@ -1,0 +1,59 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: DCO gate pull request
+
+# Reports the required `DCO gate` context the same way `Nemo_CICD_Test` and
+# `multi-approval-bot-summary` report theirs: as a job on the `pull-request/<n>` mirror push,
+# so the check run lands in a check suite keyed to a real branch of this repository.
+#
+# `dco-gate.yml` publishes the same verdict through the Checks API instead, and GitHub pins
+# such a check run to the *first* check suite for its head SHA — for a fork pull request that
+# suite is keyed to the contributor's branch name, which does not exist here. When a merge box
+# fails to bind that suite it reports the gate as "Expected — waiting for status to be
+# reported" forever: republishing cannot move a check run between suites, so neither updating
+# the run in place nor creating a replacement repairs it. A job has no such failure mode.
+#
+# Both producers therefore report `DCO gate` for a pull-request head for now, and both mirror
+# the same trusted verdict, so they agree; branch protection reads whichever is newer. This is
+# deliberately additive — the worst case is the status quo — and `dco-gate.yml` together with
+# its reconcile sweep should be retired once this job is observed binding on real pull
+# requests, which also drops ~950 API requests per sweep.
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+permissions:
+  checks: read
+  contents: read
+
+jobs:
+  DCO_gate:
+    name: DCO gate
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout protected default branch scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Verify the trusted DCO result
+        env:
+          DCO_GATE_MODE: verify
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/dco_gate.py

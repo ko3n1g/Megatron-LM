@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import contextlib
+import io
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -233,6 +235,62 @@ class TestDcoGate(unittest.TestCase):
         self.assertIn("name: DCO gate", merge_group)
         self.assertIn("DCO_merge_group:", main)
         self.assertIn("name: DCO", main)
+
+    def test_verify_waits_for_a_late_dco_verdict(self) -> None:
+        source = _dco(20, "success")
+        clock = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+        with (
+            mock.patch.object(dco_gate, "_list_check_runs", side_effect=[[], [], [source]]),
+            mock.patch.object(dco_gate, "time") as patched_time,
+        ):
+            patched_time.monotonic.side_effect = lambda: next(clock)
+            self.assertIs(
+                dco_gate.await_dco_verdict(
+                    "https://api", "NVIDIA/Megatron-LM", SHA, "token", timeout=100, poll=0
+                ),
+                source,
+            )
+
+    def test_verify_fails_closed_when_no_verdict_arrives(self) -> None:
+        with (
+            mock.patch.object(dco_gate, "_list_check_runs", return_value=[]),
+            mock.patch.object(dco_gate, "time") as patched_time,
+        ):
+            patched_time.monotonic.side_effect = [0.0, 100.0]
+            with self.assertRaisesRegex(GateError, "no completed DCO App verdict"):
+                dco_gate.await_dco_verdict(
+                    "https://api", "NVIDIA/Megatron-LM", SHA, "token", timeout=10, poll=0
+                )
+
+    def test_verify_mode_mirrors_the_verdict_into_its_own_exit_code(self) -> None:
+        for conclusion, expected in (("success", 0), ("action_required", 1)):
+            with self.subTest(conclusion=conclusion):
+                with (
+                    mock.patch.dict("os.environ", {"GITHUB_SHA": SHA}, clear=False),
+                    mock.patch.object(
+                        dco_gate, "await_dco_verdict", return_value=_dco(20, conclusion)
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    self.assertEqual(
+                        dco_gate._run_verify("NVIDIA/Megatron-LM", "https://api", "token"),
+                        expected,
+                    )
+
+    def test_verify_rejects_a_missing_or_malformed_head(self) -> None:
+        with mock.patch.dict("os.environ", {"GITHUB_SHA": "not-a-sha"}, clear=False):
+            with self.assertRaisesRegex(GateError, "invalid head SHA"):
+                dco_gate._run_verify("NVIDIA/Megatron-LM", "https://api", "token")
+
+    def test_pull_request_gate_runs_as_a_job_on_the_mirror_push(self) -> None:
+        workflow = Path(".github/workflows/dco-gate-pull-request.yml").read_text()
+        self.assertIn("name: DCO gate", workflow)
+        self.assertIn('- "pull-request/[0-9]+"', workflow)
+        self.assertIn("DCO_GATE_MODE: verify", workflow)
+        self.assertIn("ref: ${{ github.event.repository.default_branch }}", workflow)
+        self.assertIn("checks: read", workflow)
+        self.assertNotIn("checks: write", workflow)
 
     def test_reconcile_workflow_sweeps_on_a_schedule(self) -> None:
         reconcile = Path(".github/workflows/dco-gate-reconcile.yml").read_text()
